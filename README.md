@@ -10,6 +10,7 @@ ShellKit 是一套以“简单直观、开箱即用”为目标的 Bash 脚本�
 - 安装：`bash scripts/install.sh`（默认安装到 `~/.shellkit`，生成 `~/.local/bin/sk`）
 - 使用：`sk gpu` 或 `sk sys`
 - 更新：`bash scripts/update.sh`
+- 卸载：`bash scripts/uninstall.sh`（支持 --keep-home 保留安装目录）
 - 也可直接运行：`bash main.sh gpu`
 
 可用命令

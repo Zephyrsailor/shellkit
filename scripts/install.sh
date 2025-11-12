@@ -63,10 +63,35 @@ chmod +x "$LAUNCHER"
 echo "[OK] Installed ShellKit to: $SK_HOME"
 echo "[OK] Installed launcher: $LAUNCHER"
 
-# PATH hint
+# Ensure BIN_DIR is on PATH (idempotent)
+ensure_path_line() {
+  local file="$1"; shift || true
+  local line="export PATH=\"$BIN_DIR:\$PATH\""
+  if [ -f "$file" ]; then
+    if grep -q "ShellKit PATH" "$file" 2>/dev/null; then return 0; fi
+  fi
+  {
+    echo "# >>> ShellKit PATH >>>"
+    echo "$line"
+    echo "# <<< ShellKit PATH <<<"
+  } >> "$file"
+}
+
 case ":$PATH:" in
-  *:"$BIN_DIR":*) :;;
-  *) echo "[HINT] Add to PATH: export PATH=\"$BIN_DIR:\$PATH\"";;
+  *:"$BIN_DIR":*) onpath=1 ;;
+  *) onpath=0 ;;
 esac
+
+if [ $onpath -eq 0 ]; then
+  # Choose rc files based on user's shell; fall back to common files
+  shname=$(basename "${SHELL:-}")
+  case "$shname" in
+    zsh) ensure_path_line "$HOME/.zshrc" ;;
+    bash) ensure_path_line "$HOME/.bashrc"; ensure_path_line "$HOME/.profile" ;;
+    *) ensure_path_line "$HOME/.profile" ;;
+  esac
+  echo "[OK] Added PATH update to your shell rc (open a new terminal or 'source' your rc to use 'sk')."
+  echo "[HINT] Current session: export PATH=\"$BIN_DIR:\$PATH\""
+fi
 
 echo "Try: sk gpu  or  sk sys"

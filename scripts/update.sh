@@ -50,4 +50,35 @@ chmod +x "$LAUNCHER"
 
 echo "[OK] Updated ShellKit at: $SK_HOME"
 echo "[OK] Refreshed launcher: $LAUNCHER"
+
+# Ensure BIN_DIR on PATH (idempotent)
+ensure_path_line() {
+  local file="$1"; shift || true
+  local line="export PATH=\"$BIN_DIR:\$PATH\""
+  if [ -f "$file" ]; then
+    if grep -q "ShellKit PATH" "$file" 2>/dev/null; then return 0; fi
+  fi
+  {
+    echo "# >>> ShellKit PATH >>>"
+    echo "$line"
+    echo "# <<< ShellKit PATH <<<"
+  } >> "$file"
+}
+
+case ":$PATH:" in
+  *:"$BIN_DIR":*) onpath=1 ;;
+  *) onpath=0 ;;
+esac
+
+if [ $onpath -eq 0 ]; then
+  shname=$(basename "${SHELL:-}")
+  case "$shname" in
+    zsh) ensure_path_line "$HOME/.zshrc" ;;
+    bash) ensure_path_line "$HOME/.bashrc"; ensure_path_line "$HOME/.profile" ;;
+    *) ensure_path_line "$HOME/.profile" ;;
+  esac
+  echo "[OK] Ensured PATH in your shell rc (open new terminal or source rc)."
+  echo "[HINT] Current session: export PATH=\"$BIN_DIR:\$PATH\""
+fi
+
 echo "Run: sk help"
