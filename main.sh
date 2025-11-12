@@ -27,7 +27,7 @@ is_sourced() {
 
 usage() {
   cat <<'EOF'
-用法: bash main.sh <子命令> [参数]
+用法: sk <子命令> [参数]
 
 子命令:
   gpu [--no-python|--verbose]
@@ -35,8 +35,8 @@ usage() {
   help
 
 示例:
-  bash main.sh gpu
-  bash main.sh sys
+  sk gpu
+  sk sys
 EOF
 }
 
@@ -45,7 +45,7 @@ shift || true
 
 case "$cmd" in
   gpu)
-    exec bash "$SCRIPT_DIR/lib/gpu-env-check.sh" "$@"
+    exec bash "$SCRIPT_DIR/lib/gpu-env-check.sh" --gpu-only "$@"
     ;;
   sys)
     exec bash "$SCRIPT_DIR/lib/gpu-env-check.sh" --sys-only

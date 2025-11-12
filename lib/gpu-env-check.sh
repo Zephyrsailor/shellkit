@@ -10,6 +10,7 @@
 #   --sys-only        仅输出系统信息
 #   --no-python       跳过 Python 框架检测 (PyTorch/TensorFlow)
 #   --verbose         输出更详细的原始命令结果（若可用）
+#   --py <python>     指定用于检测 PyTorch/TF 的 Python 解释器
 #   -h, --help        显示帮助
 #
 # 说明:
@@ -30,6 +31,7 @@ VERBOSE=false
 GPU_ONLY=false
 SYS_ONLY=false
 NO_PY=false
+PY_EXEC_OVERRIDE=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +39,7 @@ while [ $# -gt 0 ]; do
     --sys-only) SYS_ONLY=true ; shift ;;
     --no-python) NO_PY=true ; shift ;;
     --verbose) VERBOSE=true ; shift ;;
+    --py) PY_EXEC_OVERRIDE="${2:-}"; shift 2 ;;
     -h|--help)
       sed -n '1,50p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -77,15 +80,37 @@ os_pretty_name() {
 serial_number() {
   case "$OS" in
     Linux)
+      sn=""
       if [ -r /sys/class/dmi/id/product_serial ]; then
-        cat /sys/class/dmi/id/product_serial | tr -d '\n'
-      elif has_cmd dmidecode; then
-        dmidecode -s system-serial-number 2>/dev/null | head -n1 | tr -d '\n'
-      elif [ -r /sys/class/dmi/id/product_uuid ]; then
-        cat /sys/class/dmi/id/product_uuid | tr -d '\n'
-      else
-        echo "不可用(可能需要root或设备不支持)"
+        sn=$(tr -d '\n' < /sys/class/dmi/id/product_serial)
       fi
+      if [ -z "$sn" ] && [ -r /sys/firmware/devicetree/base/serial-number ]; then
+        sn=$(tr -d '\0\n' < /sys/firmware/devicetree/base/serial-number)
+      fi
+      if [ -z "$sn" ] && [ -r /proc/device-tree/serial-number ]; then
+        sn=$(tr -d '\0\n' < /proc/device-tree/serial-number)
+      fi
+      if [ -z "$sn" ] && awk -F': ' '/Serial/ {print $2; found=1} END{exit !found}' /proc/cpuinfo >/dev/null 2>&1; then
+        sn=$(awk -F': *' '/Serial/ {print $2; exit}' /proc/cpuinfo | tr -d '\n')
+      fi
+      if [ -z "$sn" ] && has_cmd dmidecode; then
+        # 非 root 尝试直接读取（某些系统允许）
+        out=$(dmidecode -s system-serial-number 2>/dev/null | head -n1 || true)
+        sn="${out//$'\r\n'/}"
+        if [ -z "$sn" ]; then
+          # 尝试使用 sudo -n（无密码不提示）；失败则在交互终端尝试 sudo 提示输入
+          if out=$(sudo -n dmidecode -s system-serial-number 2>/dev/null | head -n1); then
+            sn="${out//$'\r\n'/}"
+          else
+            if [ -t 1 ]; then
+              if out=$(sudo dmidecode -s system-serial-number 2>/dev/null | head -n1); then
+                sn="${out//$'\r\n'/}"
+              fi
+            fi
+          fi
+        fi
+      fi
+      echo "$sn"
       ;;
     Darwin)
       # 优先使用 system_profiler，其次 ioreg
@@ -105,7 +130,7 @@ cpu_info() {
   case "$OS" in
     Linux)
       if has_cmd lscpu; then
-        lscpu | awk -F': *' '/Model name|Architecture|^CPU\(s\)/ {gsub(/^ +| +$/,"",$2); printf "  - %s: %s\n", $1, $2}'
+        lscpu | awk -F': *' '/Model name|Architecture|^CPU\(s\):/ {gsub(/^ +| +$/,"",$2); printf "  - %s: %s\n", $1, $2}'
       else
         model=$(awk -F': *' '/model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null || echo unknown)
         cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo unknown)
@@ -130,13 +155,27 @@ cpu_info() {
 mem_info() {
   case "$OS" in
     Linux)
-      if has_cmd free; then
-        total=$(free -h | awk '/Mem:/ {print $2}')
-        used=$(free -h | awk '/Mem:/ {print $3}')
-        kv "内存(总/已用)" "$total / $used"
+      # 使用 /proc/meminfo 计算，避免本地化差异
+      if [ -r /proc/meminfo ]; then
+        mem_total_kb=$(awk '/MemTotal:/ {print $2}' /proc/meminfo)
+        mem_avail_kb=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
+        if [ -n "${mem_total_kb:-}" ] && [ -n "${mem_avail_kb:-}" ]; then
+          used_kb=$((mem_total_kb - mem_avail_kb))
+          total_gi=$(awk -v kb="$mem_total_kb" 'BEGIN{printf "%.1f GiB", kb/1024/1024}')
+          used_gi=$(awk -v kb="$used_kb" 'BEGIN{printf "%.1f GiB", kb/1024/1024}')
+          kv "内存(总/已用)" "$total_gi / $used_gi"
+        else
+          total=$(awk '/MemTotal/ {printf "%.1f GiB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo unknown)
+          kv "内存总量" "$total"
+        fi
       else
-        total=$(awk '/MemTotal/ {printf "%.1f GiB", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo unknown)
-        kv "内存总量" "$total"
+        if has_cmd free; then
+          total=$(free -h | awk 'NR==2{print $2}')
+          used=$(free -h | awk 'NR==2{print $3}')
+          kv "内存(总/已用)" "$total / $used"
+        else
+          kv "内存总量" "未知"
+        fi
       fi
       ;;
     Darwin)
@@ -170,7 +209,7 @@ disk_info() {
   case "$OS" in
     Linux)
       if has_cmd lsblk; then
-        lsblk -d -o NAME,SIZE,MODEL | sed '1d;s/^/  - 物理盘: /'
+        lsblk -d -o NAME,SIZE,MODEL | sed '1d' | grep -v '^loop' | sed 's/^/  - 物理盘: /'
       fi
       ;;
     Darwin)
@@ -203,17 +242,65 @@ nvidia_info() {
     if out=$(nvidia-smi --query-driver_version --format=csv,noheader 2>/dev/null); then
       kv "驱动版本" "$out"
     fi
-    if out=$(nvidia-smi --query-gpu=name,memory.total,memory.free,uuid,compute_cap --format=csv,noheader 2>/dev/null); then
+    if out=$(nvidia-smi --query-gpu=index,name,memory.total,memory.used,uuid,compute_cap --format=csv,noheader 2>/dev/null); then
       IFS=$'\n' read -r -d '' -a arr < <(printf '%s\0' "$out") || true
-      idx=0
       for line in "${arr[@]:-}"; do
-        idx=$((idx+1))
-        name=$(echo "$line" | awk -F', *' '{print $1}')
-        memt=$(echo "$line" | awk -F', *' '{print $2}')
-        memf=$(echo "$line" | awk -F', *' '{print $3}')
-        uuid=$(echo "$line" | awk -F', *' '{print $4}')
-        cc=$(echo "$line" | awk -F', *' '{print $5}')
-        kv "GPU#$idx" "$name | 显存: $memt，总空闲: $memf | CC: $cc | $uuid"
+        idx=$(echo "$line" | awk -F', *' '{print $1}')
+        name=$(echo "$line" | awk -F', *' '{print $2}')
+        memt=$(echo "$line" | awk -F', *' '{print $3}')
+        memu=$(echo "$line" | awk -F', *' '{print $4}')
+        uuid=$(echo "$line" | awk -F', *' '{print $5}')
+        cc=$(echo "$line" | awk -F', *' '{print $6}')
+        # 计算空闲（如果可用）
+        memf=""
+        if [ -n "${memt}" ] && [ -n "${memu}" ] && [[ ! "$memt" =~ N/A ]] && [[ ! "$memu" =~ N/A ]]; then
+          # 去单位 MiB
+          t=$(echo "$memt" | sed 's/[^0-9]//g')
+          u=$(echo "$memu" | sed 's/[^0-9]//g')
+          if [ -n "$t" ] && [ -n "$u" ]; then
+            f=$((t-u))
+            memf="${f} MiB"
+          fi
+        fi
+        # 若显存为 N/A，用 -q/-x 方式兜底（优先 FB memory usage 块）
+        if [ -z "$memt" ] || [[ "$memt" =~ N/A ]]; then
+          q=$(nvidia-smi -q -i "$idx" -d MEMORY 2>/dev/null)
+          fb=$(echo "$q" | awk 'BEGIN{IGNORECASE=1} /FB .*memory usage/ {f=1; next} f && NF==0 {exit} f {print}')
+          if [ -z "$fb" ]; then
+            fb=$(echo "$q" | awk 'BEGIN{IGNORECASE=1} /Memory Usage/ {f=1; next} f && NF==0 {exit} f {print}')
+          fi
+          if [ -n "$fb" ]; then
+            # 优先 Total/Used/Free
+            [ -z "$memt" ] && memt=$(echo "$fb" | awk -F': *' 'BEGIN{IGNORECASE=1} /Total/ {print $2; exit}')
+            u2=$(echo "$fb" | awk -F': *' 'BEGIN{IGNORECASE=1} /Used/ {print $2; exit}')
+            [ -z "$memf" ] && memf=$(echo "$fb" | awk -F': *' 'BEGIN{IGNORECASE=1} /Free/ {print $2; exit}')
+            if [ -z "$memf" ] && [ -n "$memt" ] && [ -n "$u2" ]; then
+              t=$(echo "$memt" | sed 's/[^0-9]//g')
+              u=$(echo "$u2" | sed 's/[^0-9]//g')
+              if [ -n "$t" ] && [ -n "$u" ]; then memf="$((t-u)) MiB"; fi
+            fi
+          fi
+          # 再尝试 XML 输出（更稳定的字段名）
+          if { [ -z "$memt" ] || [ -z "$memf" ]; } && nvidia-smi -q -x -i "$idx" >/dev/null 2>&1; then
+            xml=$(nvidia-smi -q -x -i "$idx" 2>/dev/null)
+            if [ -z "$memt" ]; then
+              memt=$(echo "$xml" | awk -F'[<>]' '/<fb_memory_usage>/{f=1;next} f&&$2=="total" {print $3; exit} f&&$2=="fb_memory_usage"{f=0}')
+            fi
+            if [ -z "$memf" ]; then
+              memf=$(echo "$xml" | awk -F'[<>]' '/<fb_memory_usage>/{f=1;next} f&&$2=="free" {print $3; exit} f&&$2=="fb_memory_usage"{f=0}')
+            fi
+          fi
+          # 再兜底，用概要表格解析（不可靠，但总比空好）
+          if [ -z "$memt" ] || [ -z "$memf" ]; then
+            sum=$(nvidia-smi 2>/dev/null | sed -n 's/.*Default: *\([0-9]*\)MiB .*Used: *\([0-9]*\)MiB.*/\1 \2/p' | head -n1)
+            if [ -n "$sum" ]; then
+              t=$(echo "$sum" | awk '{print $1}')
+              u=$(echo "$sum" | awk '{print $2}')
+              memt="${t} MiB"; memf="$((t-u)) MiB"
+            fi
+          fi
+        fi
+        kv "GPU#$idx" "$name | 显存: ${memt:-N/A}，总空闲: ${memf:-N/A} | CC: ${cc:-N/A} | $uuid"
       done
     else
       nvidia-smi -L || true
@@ -269,27 +356,53 @@ lspci_gpu_fallback() {
 cuda_info() {
   section "CUDA 工具链"
   if has_cmd nvcc; then
-    ver=$(nvcc --version | awk -F', | ' '/release/ {for(i=1;i<=NF;i++) if($i ~ /^V?[0-9]/) v=$i; } END{print v}')
-    kv "nvcc" "已安装, 版本: ${ver:-未知}"
+    # 兼容不同输出格式
+    ver=$(nvcc --version 2>/dev/null | awk '/release/{for(i=1;i<=NF;i++) if($i ~ /release/) rel=$(i+1); } END{gsub(",","",rel); print rel}')
+    [ -z "$ver" ] && ver=$(nvcc --version 2>/dev/null | awk -F'V' '/release/{print $2}')
+    kv "NVCC" "已安装, 版本: ${ver:-未知}"
   else
     warn "未检测到 nvcc (CUDA Toolkit)"
   fi
 
   # CUDA_HOME 及 version.txt
+  # CUDA Toolkit 版本（优先 version.txt/json，回退 NVCC 解析）
+  cuda_toolkit_ver=""
   cuda_home="${CUDA_HOME:-}"
-  if [ -z "$cuda_home" ] && [ -d /usr/local/cuda ]; then cuda_home=/usr/local/cuda; fi
-  if [ -n "$cuda_home" ] && [ -f "$cuda_home/version.txt" ]; then
-    kv "CUDA_HOME" "$cuda_home"
-    kv "version.txt" "$(tr -d '\n' < "$cuda_home/version.txt")"
-  elif [ -n "$cuda_home" ]; then
-    kv "CUDA_HOME" "$cuda_home"
+  if [ -z "$cuda_home" ]; then
+    if [ -d /usr/local/cuda ]; then cuda_home=/usr/local/cuda; fi
+    # 扫描 /usr/local/cuda-* 选择存在版本文件的路径
+    for d in /usr/local/cuda-*; do
+      [ -d "$d" ] || continue
+      if [ -f "$d/version.txt" ] || [ -f "$d/version.json" ]; then
+        cuda_home="$d"
+      fi
+    done
+  fi
+  if [ -n "$cuda_home" ]; then
+    if [ -f "$cuda_home/version.txt" ]; then
+      cudatxt=$(tr -d '\n' < "$cuda_home/version.txt")
+      cuda_toolkit_ver=$(echo "$cudatxt" | sed -n 's/.*CUDA[^0-9]*\([0-9][0-9\.]*\).*/\1/p')
+    fi
+    if [ -z "$cuda_toolkit_ver" ] && [ -f "$cuda_home/version.json" ]; then
+      cuda_toolkit_ver=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9.][0-9.]*\)".*/\1/p' "$cuda_home/version.json" | head -n1)
+    fi
+  fi
+  if [ -z "$cuda_toolkit_ver" ] && [ -n "$ver" ]; then
+    cuda_toolkit_ver=$(echo "$ver" | sed -n 's/\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+  fi
+  [ -n "$cuda_toolkit_ver" ] && kv "CUDA" "$cuda_toolkit_ver"
+
+  # 也尝试从 nvidia-smi 顶部提取 CUDA 版本（驱动报告的 runtime 版本）
+  if has_cmd nvidia-smi; then
+    smi_cuda=$(nvidia-smi 2>/dev/null | grep -m1 -o 'CUDA Version: [0-9.]*' | awk '{print $3}' || true)
+    [ -n "$smi_cuda" ] && kv "CUDA(RT)" "$smi_cuda"
   fi
 
   # cuDNN 检测 (Linux/mac)
   cudnn_ver=""
   for d in \
     "$cuda_home/include" \
-    /usr/include /usr/local/cuda/include /opt/cuda/include \
+    /usr/include /usr/local/cuda/include /opt/cuda/include /usr/local/cuda-*/include \
     /Library/Frameworks /usr/local/include; do
     h="$d/cudnn_version.h"
     if [ -f "$h" ]; then
@@ -312,29 +425,49 @@ cuda_info() {
 
 python_info() {
   if [ "$NO_PY" = true ]; then warn "已跳过 Python 框架检测 (--no-python)"; return; fi
-  if ! has_cmd python3; then warn "未发现 python3，跳过 PyTorch/TensorFlow 检测"; return; fi
 
   section "Python 与 AI 框架"
-  kv "Python" "$(python3 -V 2>&1)"
-  py_exec="python3"
+
+  # 选择 Python 解释器
+  py_exec=""
+  if [ -n "$PY_EXEC_OVERRIDE" ] && command -v "$PY_EXEC_OVERRIDE" >/dev/null 2>&1; then
+    py_exec="$PY_EXEC_OVERRIDE"
+  elif has_cmd python3; then
+    py_exec="python3"
+  elif [ -n "${CONDA_PREFIX:-}" ] && [ -x "$CONDA_PREFIX/bin/python" ]; then
+    py_exec="$CONDA_PREFIX/bin/python"
+  elif has_cmd python; then
+    py_exec="python"
+  fi
+
+  if [ -z "$py_exec" ]; then
+    kv "Python" "未检测到 (可用 --py 指定解释器)"
+    kv "PyTorch" "跳过"
+    kv "TensorFlow" "跳过"
+    return
+  fi
+
+  kv "Python" "$("$py_exec" -V 2>&1)"
+
   timeout_cmd=""
   if has_cmd timeout; then timeout_cmd="timeout 15s"; fi
 
-  # PyTorch
-  $timeout_cmd $py_exec - <<'PY' 2>/dev/null || true
+  # PyTorch（含编译CUDA版本信息）
+  $timeout_cmd "$py_exec" - <<'PY' 2>/dev/null || true
 import json, sys
 try:
     import torch
     v=torch.__version__
     cuda=torch.cuda.is_available()
+    tc=getattr(torch.version, 'cuda', None)
     devs=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] if cuda else []
-    print(f"  - PyTorch: {v} | CUDA可用: {cuda} | GPUs: {', '.join(devs) if devs else '0'}")
+    print(f"  - PyTorch: {v} | TorchCUDA: {tc or 'none'} | CUDA可用: {cuda} | GPUs: {', '.join(devs) if devs else '0'}")
 except Exception as e:
     print("  - PyTorch: 未安装或导入失败")
 PY
 
   # TensorFlow
-  $timeout_cmd $py_exec - <<'PY' 2>/dev/null || true
+  $timeout_cmd "$py_exec" - <<'PY' 2>/dev/null || true
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL']='3'
 try:
@@ -357,7 +490,14 @@ system_info() {
   cpu_info
   mem_info
   disk_info
-  kv "序列号" "$(serial_number)"
+  sn="$(serial_number)"
+  if [ -n "$sn" ]; then
+    kv "序列号" "$sn"
+  else
+    kv "序列号" "不可用(可能需要root或硬件不暴露)"
+  fi
+  # 机器ID作为补充标识
+  if [ -f /etc/machine-id ]; then kv "机器ID" "$(tr -d '\n' < /etc/machine-id)"; fi
 }
 
 gpu_env() {

@@ -17,13 +17,14 @@ BIN_DIR_DEFAULT="$HOME/.local/bin"
 SK_HOME="${SK_HOME:-$HOME_DIR_DEFAULT}"
 BIN_DIR="${BIN_DIR:-$BIN_DIR_DEFAULT}"
 FORCE=false
+BIN_DIR_ARG=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --home)
       SK_HOME="$2"; shift 2;;
     --bin)
-      BIN_DIR="$2"; shift 2;;
+      BIN_DIR="$2"; BIN_DIR_ARG=true; shift 2;;
     --force)
       FORCE=true; shift;;
     -h|--help)
@@ -37,6 +38,19 @@ EOF
 done
 
 mkdir -p "$SK_HOME"
+
+# If user didn't specify --bin and BIN_DIR is default, try to pick the first
+# writable dir already present in PATH to make `sk` immediately available.
+if [ "$BIN_DIR_ARG" = false ] && [ "$BIN_DIR" = "$BIN_DIR_DEFAULT" ]; then
+  IFS=':' read -r -a path_entries <<< "${PATH:-}"
+  for p in "${path_entries[@]}"; do
+    if [ -n "$p" ] && [ -d "$p" ] && [ -w "$p" ]; then
+      BIN_DIR="$p"
+      echo "[OK] Using existing PATH dir for launcher: $BIN_DIR"
+      break
+    fi
+  done
+fi
 
 # Copy repo contents into SK_HOME, unless SK_HOME is current repo path
 SRC_DIR=$(pwd -P)
@@ -56,7 +70,7 @@ if [ ! -f "$SK_HOME/main.sh" ]; then
   echo "ShellKit not found in \"$SK_HOME\"" >&2
   exit 1
 fi
-exec bash "$SK_HOME/main.sh" "$@"
+exec bash "$SK_HOME/main.sh" "\$@"
 EOF
 chmod +x "$LAUNCHER"
 
