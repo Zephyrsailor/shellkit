@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# sk: lightweight launcher for ShellKit; useful before installation
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "$HERE/main.sh" ]; then
+  exec bash "$HERE/main.sh" "$@"
+fi
+SK_HOME="${SK_HOME:-$HOME/.shellkit}"
+if [ -f "$SK_HOME/main.sh" ]; then
+  exec bash "$SK_HOME/main.sh" "$@"
+fi
+echo "ShellKit not found. Run: bash scripts/install.sh" >&2
+exit 1
+
